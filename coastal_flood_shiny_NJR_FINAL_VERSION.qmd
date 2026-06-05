@@ -1,0 +1,658 @@
+---
+title: "Ostend — Coastal Inundation Exposure (with IPCC AR6 scenarios up to 2100)"
+format:
+  html:
+    theme: litera
+server: shiny
+---
+
+```{r setup, include=FALSE}
+# Shiny and UI
+library(shiny)
+# Spatial vector and raster handling
+library(sf)
+library(terra)
+# Data wrangling
+library(dplyr)
+library(tidyr)
+library(stringr)
+# Plotting
+library(ggplot2)
+# Interactive map
+library(leaflet)
+# Fast raster-polygon extraction
+library(exactextractr)
+library(tibble)
+library(purrr)
+# Axis label formatting
+library(scales)
+library(leafem)
+
+# Disable spherical geometry to avoid edge-case errors during masking
+sf::sf_use_s2(FALSE)
+# Suppress terra progress bars in the UI console
+terraOptions(progress = 0)
+
+# -------------------------------------------------------------------
+# Paths
+# -------------------------------------------------------------------
+out_dir   <- "outputs/ostend"
+city_slug <- "ostend"
+
+# -------------------------------------------------------------------
+# Load preprocessed outputs
+# -------------------------------------------------------------------
+# Elevation raster (DeltaDTM, ~30 m, land-only — ocean pixels are NA)
+deltadtm <- terra::rast(file.path(out_dir, "rasters", paste0(city_slug, "_deltadtm.tif")))
+# WorldPop 2020 population count raster (used as scaling baseline)
+worldpop <- terra::rast(file.path(out_dir, "rasters", paste0(city_slug, "_worldpop.tif")))
+
+# Municipal boundary polygon (used for clipping and area computation)
+city_sf <- sf::st_read(
+  file.path(out_dir, "vectors", paste0(city_slug, "_boundary.gpkg")),
+  quiet = TRUE
+) |>
+  sf::st_transform(4326) |>
+  sf::st_make_valid()
+
+# SLR projections table: columns scenario / quantile / year / slr_m
+slr_all <- readRDS(file.path(out_dir, "slr_projections.rds"))
+
+
+# ESL projections table (SLR + 100-year storm surge per scenario/year/quantile)
+esl_all <- readRDS(file.path(out_dir, "esl_projections.rds"))
+
+# The surge value is stationary per city — same for all rows.
+# Extract it once as a scalar so the reactive can just add it on top of slr_m.
+surge_m_value <- unique(esl_all$surge_m)[1]
+gauge_used    <- unique(esl_all$gauge_used)[1]
+return_period <- unique(esl_all$return_period)[1]
+# -------------------------------------------------------------------
+# SSP population projections
+# pop_proj_df stores either WorldPop SSP rasters totals or IIASA ratios
+# (see preprocessing script). The Shiny uses it to scale the 2020
+# WorldPop raster so that exposed-population estimates evolve with
+# the selected scenario and year.
+# -------------------------------------------------------------------
+pop_proj_path <- file.path(out_dir, "pop_projections.rds")
+if (file.exists(pop_proj_path)) {
+  pop_proj_df <- readRDS(pop_proj_path)
+} else {
+  # Fallback: hardcoded IIASA SSP ratios for Belgium.
+  # This allows the Shiny to run even if preprocessing has not yet
+  # produced pop_projections.rds.
+  ssp_ratios <- tibble::tribble(
+    ~year, ~ssp126, ~ssp245, ~ssp585,
+    2020,  1.000,   1.000,   1.000,
+    2030,  1.038,   1.042,   1.048,
+    2040,  1.065,   1.075,   1.088,
+    2050,  1.079,   1.097,   1.120,
+    2060,  1.081,   1.108,   1.148,
+    2070,  1.072,   1.110,   1.170,
+    2080,  1.053,   1.104,   1.184,
+    2090,  1.026,   1.092,   1.192,
+    2100,  0.994,   1.074,   1.196
+  )
+  # Reshape to long format so it matches the structure of pop_projections.rds
+  pop_proj_df <- ssp_ratios |>
+    tidyr::pivot_longer(c(ssp126, ssp245, ssp585),
+                        names_to = "scenario", values_to = "ratio") |>
+    dplyr::mutate(source = "Scaling IIASA (fallback)")
+}
+
+# Helper: return the SSP population growth ratio for a given scenario and year.
+# Linearly interpolates between available years (so any year 2020-2100 works).
+get_pop_ratio <- function(scen, yr) {
+  sub <- dplyr::filter(pop_proj_df, scenario == scen)
+  if ("ratio" %in% names(sub)) {
+    # Fallback table: ratio column already present
+    approx(sub$year, sub$ratio, xout = yr, rule = 2)$y
+  } else {
+    # Loaded from pop_projections.rds: compute ratio from population column
+    base2020 <- sub$population[sub$year == 2020]
+    if (length(base2020) == 0 || base2020 == 0) return(1)
+    approx(sub$year, sub$population / base2020, xout = yr, rule = 2)$y
+  }
+}
+
+# -------------------------------------------------------------------
+# Population density raster (2020 baseline, used for scaling)
+# -------------------------------------------------------------------
+# Load from disk if available; otherwise derive it on the fly
+dens_path <- file.path(out_dir, "rasters", paste0(city_slug, "_worldpop_density.tif"))
+if (file.exists(dens_path)) {
+  worldpop_density <- terra::rast(dens_path)
+} else {
+  # cellSize() gives the exact geodetic area per cell (accounts for cos-latitude distortion)
+  pixel_area_km2   <- terra::cellSize(worldpop, unit = "km")
+  worldpop_density <- worldpop / pixel_area_km2
+  names(worldpop_density) <- "pop_per_km2"
+}
+
+# -------------------------------------------------------------------
+# Reproject once to WGS84 and clip to city boundary
+# -------------------------------------------------------------------
+city_vect_ll <- terra::vect(city_sf)
+
+# Elevation: reprojected and clipped — the NA ocean pixels are preserved
+deltadtm_city <- terra::mask(
+  terra::crop(terra::project(deltadtm, "EPSG:4326"), city_vect_ll),
+  city_vect_ll
+)
+# worldpop_city and worldpop_density_city are 2020 baselines.
+# The Shiny scales them by get_pop_ratio() at runtime — they must be kept.
+worldpop_city <- terra::mask(
+  terra::crop(terra::project(worldpop, "EPSG:4326"), city_vect_ll),
+  city_vect_ll
+)
+worldpop_density_city <- terra::mask(
+  terra::crop(terra::project(worldpop_density, "EPSG:4326"), city_vect_ll),
+  city_vect_ll
+)
+
+# north arrow
+north_html <- htmltools::HTML(
+  '<div style="background: white; padding: 6px 8px; border: 2px solid #555;
+               border-radius: 4px; font-family: sans-serif; text-align: center;
+               box-shadow: 0 1px 3px rgba(0,0,0,0.3);">
+     <svg width="20" height="28" viewBox="0 0 20 28">
+       <polygon points="10,0 18,24 10,18 2,24" fill="#333"/>
+     </svg>
+     <div style="font-size: 11px; font-weight: bold; color: #333;">N</div>
+   </div>'
+)
+
+# -------------------------------------------------------------------
+# Scenario labels and colors
+# -------------------------------------------------------------------
+scenario_labels <- c(
+  ssp126 = "SSP1-2.6 — Optimistic",
+  ssp245 = "SSP2-4.5 — Intermediate",
+  ssp585 = "SSP5-8.5 — Pessimistic"
+)
+scenario_colors <- c(
+  ssp126 = "#2166ac",
+  ssp245 = "#f4a582",
+  ssp585 = "#d6604d"
+)
+
+# -------------------------------------------------------------------
+# Available years (slider)
+# -------------------------------------------------------------------
+# Keep only years within the 2020-2100 window used in the UI slider
+years_available <- sort(unique(slr_all$year))
+years_shiny     <- years_available[years_available >= 2020 & years_available <= 2100]
+
+# -------------------------------------------------------------------
+# Map extent
+# -------------------------------------------------------------------
+# Add a 2.5 km display buffer around the city so the map is not clipped
+# right at the municipal boundary
+bbox_ll <- sf::st_bbox(
+  sf::st_transform(
+    sf::st_buffer(sf::st_transform(city_sf, 32631), 2500),
+    4326
+  )
+)
+
+# -------------------------------------------------------------------
+# City area in km²
+# -------------------------------------------------------------------
+# Used to compute the "% of city exposed" statistic
+city_area_km2 <- as.numeric(sf::st_area(sf::st_transform(city_sf, 32631))) / 1e6
+
+# -------------------------------------------------------------------
+# Helper functions
+# -------------------------------------------------------------------
+
+# Ocean-connectivity flood filter.
+# Retains only flood pixels contiguous with open ocean (NA pixels in DeltaDTM).
+# Isolated inland depressions (e.g. behind dikes or ridges) are excluded.
+# See preprocessing script for the full algorithm documentation.
+flood_connected <- function(elev_raster, slr_val, n_border = 5L) {
+  flooded_land  <- terra::ifel(!is.na(elev_raster) & elev_raster <= slr_val, 1L, NA)
+  elev_ext      <- terra::extend(elev_raster, n_border)
+  flood_ext     <- terra::extend(flooded_land, n_border)
+  ocean_ext     <- terra::ifel(is.na(elev_ext), 1L, NA)
+  # Merge flooded-land and ocean into a single binary surface
+  combined      <- terra::cover(flood_ext, ocean_ext)
+  # Label connected components (8-direction connectivity)
+  patches       <- terra::patches(combined, directions = 8L, zeroAsNA = TRUE)
+  # Identify patch IDs that contain at least one ocean pixel
+  ocean_patch_r <- terra::ifel(!is.na(ocean_ext), patches, NA)
+  ocean_ids     <- unique(na.omit(terra::values(ocean_patch_r, mat = FALSE)))
+  if (length(ocean_ids) == 0L) {
+    warning("flood_connected: no ocean pixels found; returning empty raster.")
+    return(terra::ifel(!is.na(elev_raster), NA_integer_, NA_integer_))
+  }
+  # Remap ocean-connected patches to 1; isolated patches become NA
+  rcl           <- cbind(ocean_ids, rep(1L, length(ocean_ids)))
+  connected_ext <- terra::classify(patches, rcl, others = NA)
+  connected     <- terra::crop(connected_ext, elev_raster)
+  # Remove ocean pixels themselves from the output (land-only result)
+  result        <- terra::mask(connected, flooded_land, maskvalue = NA)
+  names(result) <- "flooded"
+  result
+}
+
+# Return a binary flood raster (1 = flooded, NA = not flooded).
+# connected = TRUE applies the ocean-connectivity filter; FALSE uses the simple bathtub.
+flood_raster_from_slr <- function(slr_val, connected = FALSE) {
+  if (connected) {
+    flood_connected(deltadtm_city, slr_val)
+  } else {
+    flooded <- deltadtm_city <= slr_val
+    # Preserve NA (ocean) pixels so they are not shown as flooded land
+    flooded <- terra::ifel(is.na(deltadtm_city), NA, flooded)
+    names(flooded) <- "flooded"
+    flooded
+  }
+}
+
+# Convert the binary flood raster to an sf polygon for Leaflet rendering
+flood_polygon_from_raster <- function(flooded_raster) {
+  tryCatch({
+    flooded_only <- terra::ifel(flooded_raster == 1, 1, NA)
+    p <- terra::as.polygons(flooded_only, dissolve = TRUE, na.rm = TRUE) |>
+      sf::st_as_sf() |>
+      sf::st_make_valid() |>
+      sf::st_transform(4326)
+    if (nrow(p) == 0) NULL else p
+  }, error = function(e) NULL)
+}
+
+# Compute the total flooded area in km² from the binary raster.
+# Uses per-cell geodetic areas to handle WGS84 distortion.
+flooded_area_km2_from_raster <- function(flooded_raster) {
+  tryCatch({
+    flooded_only   <- terra::ifel(flooded_raster == 1, 1, NA)
+    area_r         <- terra::cellSize(flooded_only, unit = "km")
+    flooded_area_r <- terra::ifel(is.na(flooded_only), NA, area_r)
+    terra::global(flooded_area_r, "sum", na.rm = TRUE)[1, 1]
+  }, error = function(e) 0)
+}
+
+# Population exposure sum.
+# pop_raster_scaled: optional SpatRaster already multiplied by the SSP ratio.
+# Falls back to the 2020 worldpop_city raster when not supplied.
+exposed_population_from_polygon <- function(flood_poly, pop_raster_scaled = NULL) {
+  if (is.null(flood_poly) || nrow(flood_poly) == 0) return(0)
+  raster_to_use <- if (!is.null(pop_raster_scaled)) pop_raster_scaled else worldpop_city
+  tryCatch({
+    exactextractr::exact_extract(raster_to_use, flood_poly, "sum") |>
+      sum(na.rm = TRUE)
+  }, error = function(e) 0)
+}
+```
+
+## Context
+
+This application maps the potential coastal inundation exposure of Ostend (Belgium) under three IPCC AR6 greenhouse gas emission scenarios and across the 21st century. A static bathtub model is used : a pixel is considered exposed when its elevation (DeltaDTM, 30 m resolution) is at or below the projected sea-level rise relative to the 1995–2014 baseline. The exposed population is estimated from WorldPop data scaled to the selected SSP scenario and year using IIASA SSP demographic projections.
+
+> This is not a hydrodynamic flood model. Storm surge propagation, tides and drainage infrastructure are not accounted for. Results represent a topographic exposure proxy. Two flood modes are available: the **Simple bathtub** marks every pixel below the SLR threshold; **Ocean-connected only** shows only areas connected to the sea and below SLR threshold. Therefore, it does not consider areas protected by dikes to be at risk. **100 year storm surge** adds a stationary surge height (~224 cm at Oostende) on top of the mean SLR. This shows what could be flooded if a 1% probability storm hits in the selected year and scenario. The probability is annual and does not depend on the year chosen.
+
+# How to use the controls
+
+**Projection year** : slide to explore how exposure evolves between 2020 and 2100.
+
+**Emissions scenario** : choose between an optimistic (SSP1-2.6), intermediate (SSP2-4.5), or pessimistic (SSP5-8.5) future.
+
+**Confidence level** : the IPCC projections are probabilistic. The median (50%) is the central estimate. Choosing 83% or 95% means that only 17% or 5% of model runs project more sea-level rise than shown.
+
+## Controls
+
+```{r ui_controls}
+fluidRow(
+  column(4,
+    sliderInput("year", label = "Projection year:",
+                min = min(years_shiny), max = max(years_shiny),
+                value = 2050, step = 10, sep = "",
+                animate = animationOptions(interval = 1200, loop = FALSE))
+  ),
+  column(4,
+    selectInput("scenario", label = "Emissions scenario:",
+                choices  = setNames(names(scenario_labels), scenario_labels),
+                selected = "ssp245")
+  ),
+  column(4,
+    selectInput("quantile", label = "Confidence level:",
+                choices = c("Median (50%)"           = "0.50",
+                            "Optimistic (17%)"       = "0.17",
+                            "Pessimistic (83%)"      = "0.83",
+                            "Very pessimistic (95%)" = "0.95"),
+                selected = "0.50")
+  )
+)
+fluidRow(
+  column(12,
+    div(
+      style = "margin-top:6px; padding:8px 12px; background:#f0f4f8;
+               border-left:4px solid #2196F3; border-radius:4px;",
+      checkboxInput(
+        "connectivity",
+        label = HTML("<b>Ocean-connected only</b>"),
+        value = TRUE
+      )
+    )
+  )
+)
+fluidRow(
+  column(12,
+    div(
+      style = "margin-top:6px; padding:8px 12px; background:#fff3e0;
+               border-left:4px solid #ff9800; border-radius:4px;",
+      checkboxInput(
+        "include_surge",
+        label = HTML(paste0(
+          "<b>Include ", return_period,
+          "-year storm surge</b> "
+        )),
+        value = FALSE
+      )
+    )
+  )
+)
+```
+
+## Interactive map
+
+```{r ui_map}
+leafletOutput("flood_map", height = "550px")
+```
+
+## Summary statistics
+
+```{r ui_stats}
+fluidRow(
+  column(3, wellPanel(h4("Sea-level rise"),    textOutput("slr_value"),
+                      style = "text-align:center; background:#e8f4f8;")),
+  column(3, wellPanel(h4("Flooded area"),      textOutput("flooded_area"),
+                      style = "text-align:center; background:#fde0dc;")),
+  column(3, wellPanel(h4("Exposed population"), textOutput("pop_exposed"),
+                      style = "text-align:center; background:#fde0dc;")),
+  column(3, wellPanel(h4("Exposed city area"), textOutput("pct_exposed"),
+                      style = "text-align:center; background:#fde0dc;"))
+)
+```
+
+## Temporal evolution
+
+```{r ui_timeseries}
+plotOutput("ts_plot", height = "320px")
+```
+
+## Shiny server
+
+```{r server}
+#| context: server
+# -------------------------------------------------------------------
+# Reactive: total water-level value for selected scenario/year/quantile.
+# When `include_surge` is ON, the stationary storm-surge return level is
+# added on top of the mean SLR. The water-level returned by this reactive
+# is what drives the flood map (bathtub threshold) and the statistics.
+# -------------------------------------------------------------------
+slr_reactive <- reactive({
+  base_slr <- slr_all |>
+    dplyr::filter(
+      scenario == input$scenario,
+      year     == input$year,
+      abs(quantile - as.numeric(input$quantile)) < 0.001
+    ) |>
+    dplyr::pull(slr_m) |>
+    dplyr::first()
+
+  if (isTRUE(input$include_surge)) {
+    base_slr + surge_m_value
+  } else {
+    base_slr
+  }
+})
+
+# -------------------------------------------------------------------
+# Reactive: flood products + SSP-scaled population rasters
+# -------------------------------------------------------------------
+flood_reactive <- reactive({
+  slr_val <- slr_reactive()
+  # Abort early if SLR value is unavailable (e.g. missing scenario/year combination)
+  if (is.null(slr_val) || length(slr_val) == 0 || is.na(slr_val)) return(NULL)
+
+  # 1. Flood raster (simple bathtub or ocean-connected)
+  use_connectivity <- isTRUE(input$connectivity)
+  flooded    <- flood_raster_from_slr(slr_val, connected = use_connectivity)
+  flood_poly <- flood_polygon_from_raster(flooded)
+
+  # 2. SSP population ratio for the selected scenario and year.
+  #    This scales the 2020 WorldPop baseline so that population exposure
+  #    reflects the demographic trajectory of the chosen scenario.
+  pop_ratio <- tryCatch(
+    get_pop_ratio(input$scenario, as.numeric(input$year)),
+    error = function(e) 1  # default to ratio = 1 (no change) on error
+  )
+
+  # 3. Scaled rasters:
+  #    - worldpop_density_proj: density (inhab/km²) for the map gradient
+  #    - worldpop_count_proj:   count (persons) for the exposure statistic
+  worldpop_density_proj <- worldpop_density_city * pop_ratio
+  worldpop_count_proj   <- worldpop_city         * pop_ratio
+
+  # 4. Mask density raster to the flooded zone for the population gradient layer
+  pop_flooded <- if (!is.null(flood_poly) && nrow(flood_poly) > 0) {
+    tryCatch(
+      terra::mask(worldpop_density_proj, terra::vect(flood_poly)),
+      error = function(e) NULL
+    )
+  } else NULL
+
+  list(
+    raster           = flooded,
+    poly             = flood_poly,
+    slr_m            = slr_val,
+    pop_ratio        = pop_ratio,
+    pop_flooded      = pop_flooded,         # density masked to flood zone (map)
+    pop_count_scaled = worldpop_count_proj  # full count raster scaled to SSP (stats)
+  )
+})
+
+# -------------------------------------------------------------------
+# Leaflet map (static base — flood layers updated via leafletProxy)
+# -------------------------------------------------------------------
+output$flood_map <- renderLeaflet({
+  leaflet() |>
+    addProviderTiles("Esri.WorldImagery",
+                     options = providerTileOptions(maxZoom = 18)) |>
+    addProviderTiles("CartoDB.PositronOnlyLabels") |>
+    fitBounds(bbox_ll[["xmin"]], bbox_ll[["ymin"]],
+              bbox_ll[["xmax"]], bbox_ll[["ymax"]]) |>
+    addPolygons(data = city_sf, fill = FALSE,
+                color = "#333333", weight = 2.5,
+                group = "City boundary") |>
+    addScaleBar(position = "bottomleft",
+                options = scaleBarOptions(metric = TRUE,
+                                          imperial = FALSE,
+                                          maxWidth = 150)) |>
+    addControl(html = north_html, position = "topright") |>
+    addLayersControl(
+      overlayGroups = c("City boundary", "Flooded area", "Exposed population"),
+      options = layersControlOptions(collapsed = FALSE)
+    )
+})
+
+# -------------------------------------------------------------------
+# Update flood + population layers without rebuilding the map
+# -------------------------------------------------------------------
+observe({
+  req(input$scenario, input$year, input$quantile)
+  res <- flood_reactive()
+
+  # Clear previous flood and population layers before redrawing
+  leafletProxy("flood_map") |>
+    clearGroup("Flooded area") |>
+    clearGroup("Exposed population") |>
+    removeControl("pop_legend")
+
+  if (!is.null(res) && !is.null(res$poly) && nrow(res$poly) > 0) {
+
+    # Flood extent polygon — semi-transparent blue fill
+    leafletProxy("flood_map") |>
+      addPolygons(
+        data        = res$poly,
+        fillColor   = "#2196F3",
+        fillOpacity = 0.25,
+        color       = "#0d47a1",
+        weight      = 0.8,
+        group       = "Flooded area",
+        popup       = paste0(
+          "<b>Potentially flooded area</b><br>",
+          "Sea-level rise: +", round(res$slr_m * 100, 1), " cm<br>",
+          "Scenario: ", scenario_labels[input$scenario], "<br>",
+          "Year: ", input$year, "<br>",
+          "Mode: ", if (isTRUE(input$connectivity)) "Ocean-connected only"
+                    else "Simple bathtub", "<br>",
+          "Population ratio vs 2020: x", round(res$pop_ratio, 3)
+        )
+      )
+
+    # Population density gradient overlay
+    if (!is.null(res$pop_flooded)) {
+      pop_vals     <- terra::values(res$pop_flooded, na.rm = TRUE)
+      pop_vals_pos <- pop_vals[pop_vals > 0]
+      # Separate zero-population pixels (grey) from populated pixels (gradient)
+      pop_zero     <- terra::ifel(res$pop_flooded == 0, 1L, NA)
+      pop_has_pop  <- terra::ifel(res$pop_flooded >  0, res$pop_flooded, NA)
+      has_zero     <- sum(!is.na(terra::values(pop_zero))) > 0
+      has_pop      <- length(pop_vals_pos) > 0 && max(pop_vals_pos, na.rm = TRUE) > 0
+
+      lproxy <- leafletProxy("flood_map")
+
+      # Grey layer: flooded pixels with no population
+      if (has_zero) {
+        lproxy <- lproxy |>
+          addRasterImage(pop_zero, colors = "#BBBBBB",
+                         opacity = 0.65, group = "Exposed population")
+      }
+
+      # Yellow-red gradient: flooded pixels with population
+      if (has_pop) {
+        # Domain is restricted to positive values so zero pixels don't pull the scale
+        pal_pop <- colorNumeric(
+          palette  = c("#FFFF33", "#FF8C00", "#CC0000"),
+          domain   = pop_vals_pos,
+          na.color = "transparent"
+        )
+        lproxy <- lproxy |>
+          addRasterImage(pop_has_pop, colors = pal_pop,
+                         opacity = 0.85, group = "Exposed population")
+      }
+
+      # Build legend: grey entry first (if any), then three gradient classes
+      legend_colors <- c(
+        if (has_zero) "#BBBBBB",
+        if (has_pop)  c("#FFFF33", "#FF8C00", "#CC0000")
+      )
+      legend_labels <- c(
+        if (has_zero) "No population",
+        if (has_pop)  c(
+          paste0("Low (< ",    round(quantile(pop_vals_pos, 0.33, na.rm = TRUE)), ")"),
+          paste0("Medium (< ", round(quantile(pop_vals_pos, 0.66, na.rm = TRUE)), ")"),
+          paste0("High (>=",   round(quantile(pop_vals_pos, 0.66, na.rm = TRUE)), ")")
+        )
+      )
+      lproxy |>
+        addLegend(position = "bottomright",
+                  colors = legend_colors, labels = legend_labels,
+                  title   = paste0("Population density<br>(inhab/km²)<br>",
+                                   input$scenario, " — ", input$year),
+                  layerId = "pop_legend", opacity = 0.85)
+    }
+  }
+})
+
+# -------------------------------------------------------------------
+# Summary statistics
+# -------------------------------------------------------------------
+output$slr_value <- renderText({
+  slr_val <- slr_reactive()
+  if (is.null(slr_val) || is.na(slr_val)) return("N/A")
+  if (isTRUE(input$include_surge)) {
+    paste0("+", round(slr_val * 100, 1), " cm",
+           " (SLR + ", return_period, "-yr surge)")
+  } else {
+    paste0("+", round(slr_val * 100, 1), " cm (SLR only)")
+  }
+})
+
+output$flooded_area <- renderText({
+  res <- flood_reactive()
+  if (is.null(res)) return("0 km2")
+  area <- flooded_area_km2_from_raster(res$raster)
+  paste0(round(area, 2), " km2")
+})
+
+output$pop_exposed <- renderText({
+  res <- flood_reactive()
+  if (is.null(res)) return("0 people")
+  # Uses the SSP-scaled count raster so the number reflects the chosen scenario+year
+  pop <- exposed_population_from_polygon(res$poly, res$pop_count_scaled)
+  paste0(format(round(pop), big.mark = ","), " people")
+})
+
+output$pct_exposed <- renderText({
+  res <- flood_reactive()
+  if (is.null(res)) return("0 %")
+  area <- flooded_area_km2_from_raster(res$raster)
+  paste0(round(area / city_area_km2 * 100, 1), " %")
+})
+
+# -------------------------------------------------------------------
+# Time-series plot (SLR trajectories with selected point highlighted)
+# -------------------------------------------------------------------
+output$ts_plot <- renderPlot({
+  q_val <- as.numeric(input$quantile)
+
+  # Prepare data: keep 5th, 50th, 95th percentiles over 2020-2100
+  slr_plot_df <- slr_all |>
+    dplyr::filter(quantile %in% c(0.05, 0.50, 0.95),
+                  year >= 2020, year <= 2100) |>
+    dplyr::mutate(scenario_label = scenario_labels[scenario]) |>
+    dplyr::arrange(scenario, quantile, year)
+
+  # Wide format needed for geom_ribbon (ymin = 5th, ymax = 95th)
+  ribbon_df <- slr_plot_df |>
+    dplyr::filter(quantile %in% c(0.05, 0.95)) |>
+    dplyr::select(-scenario_label) |>
+    tidyr::pivot_wider(names_from = quantile, values_from = slr_m) |>
+    dplyr::arrange(scenario, year)
+
+  # Single point for the currently selected scenario / year / quantile
+  selected_pt <- slr_all |>
+    dplyr::filter(scenario == input$scenario,
+                  year     == input$year,
+                  abs(quantile - q_val) < 0.001)
+
+  ggplot(slr_plot_df |> dplyr::filter(quantile == 0.50),
+         aes(x = year, y = slr_m * 100, color = scenario)) +
+    # Uncertainty ribbon: 5th to 95th percentile
+    geom_ribbon(data = ribbon_df,
+                aes(x = year, ymin = `0.05` * 100, ymax = `0.95` * 100, fill = scenario),
+                color = NA, alpha = 0.15, inherit.aes = FALSE) +
+    # Median trajectory line
+    geom_line(linewidth = 1) +
+    # Highlighted point for the user-selected combination
+    geom_point(data = selected_pt,
+               aes(x = year, y = slr_m * 100),
+               size = 5, shape = 21, fill = "white",
+               color = scenario_colors[input$scenario],
+               stroke = 2, inherit.aes = FALSE) +
+    scale_color_manual(values = scenario_colors, labels = scenario_labels) +
+    scale_fill_manual( values = scenario_colors, labels = scenario_labels) +
+    scale_x_continuous(breaks = seq(2020, 2100, by = 10)) +
+    scale_y_continuous(labels = scales::label_number(suffix = " cm")) +
+    labs(title    = "IPCC AR6 sea-level rise projections for Ostend",
+         subtitle = "Line = median (50%) | Ribbon = 5th to 95th percentile",
+         x = "Year", y = "Sea-level rise (cm)",
+         color = "Scenario", fill = "Scenario",
+         caption = "Source: IPCC AR6 | Zenodo 6382554") +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom", panel.grid.minor = element_blank())
+})
+```

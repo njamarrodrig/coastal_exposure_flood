@@ -1,0 +1,1010 @@
+---
+title: "Ostend — Coastal Inundation Exposure"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Project objective
+
+This document prepares the spatial inputs required for a coastal exposure analysis of Ostend (Belgium) under 3 IPCC sea-level rise scenarios up to 2100.
+
+This study is warranted by the fact that rising sea levels are already increasing extreme high-tide levels along many European coastlines and could increase the frequency of historical coastal flooding tenfold by 2050 along most European coastlines, making it necessary to conduct a local assessment of the vulnerability of low-lying areas such as Ostend (European Environment Agency, 2024).
+
+The aim is to build a city-scale, scenario-based exposure workflow rather than a full hydrodynamic flood model. The preprocessing script assembles the main datasets needed for the analysis:
+
+-   The municipal boundary of the city (In this case : Ostend).
+-   A local elevation raster from DeltaDTM (30 m resolution).
+-   Population data from WorldPop (2020 baseline + SSP projections to 2100) (100 m resolution).
+-   Sea-level rise projections from IPCC AR6 up to 2100.
+-   Extreme sea-level events: 100-year storm-surge return levels derived from European tide-gauge records (Hermans et al. 2023), added on top of the projected mean sea-level rise.
+
+IPCC AR6 sea-level projections were used because they provide an authoritative and scenario-based reference framework consistent with the most recent IPCC assessment for every IPPC grid point on Earth. While also allowing uncertainty to be explored through quantiles. However, the mean sea-level rise projected by AR6 only represents the *average* future water level: it does not capture the short-duration extreme events (storm surges, wave setup) that drive most actual coastal flooding. To address this, the workflow adds a stationary 100-year storm-surge height to the AR6 projections, derived from extreme-value analyses of European tide-gauge records (Hermans et al. 2023). WorldPop was selected to represent the spatial distribution of the population potentially exposed, as it provides gridded population counts at fine spatial resolution that can be aggregated to custom exposure zones. DeltaDTM was used as the elevation dataset because it was specifically developed for coastal applications, with a spatial resolution of 30 m and improved vertical accuracy through corrections based on ICESat-2 and GEDI data, making it particularly suitable for low-lying coastal environments
+
+(Pronk et al. 2024) (Garner et al. 2021). Given that this work relies on large datasets, which inevitably contain some margin of error (like resolution). The map and statistics should be viewed as screening tools for identifying locations that may require further risk analysis.
+
+**The logic is simple**: this script prepares and saves all required inputs once, and a separate Shiny application then loads these outputs for interactive exploration by scenario, year, and quantile.\
+
+**Before running any R code**, two dataset must be downloaded manually and placed in the correct folder. In the folder created and named “./data/”. create a subfolder named “./data/deltadtm_tiles/” and add the .tif tiles covering the study area. These can be found on this website (<https://gee-community-catalog.org/projects/delta_dtm/>) . Next, create another subfolder named “./data/slr”. Add to this folder the 3 SLR scenarios (netcdf files) findale in this Zenodo <https://zenodo.org/records/6382554> (open-source research data repository software).
+
+\
+**your working directory should look like this** :\
+your_project/\
+├── coastal_flood_prepropreccing_NJR.qmd\
+├── coastal_flood_shiny_NJR.qmd\
+│\
+└── **data/** ← create this folder\
+├── **deltadtm_tiles/** ← create + fill manually\
+│ ├── tile_NXXEXXX.tif\
+│ └── tile_NYYEYYY.tif (as many tiles as needed)\
+└── **slr/** ← create + fill manually\
+├── total_ssp126_medium_confidence_values.nc\
+├── total_ssp245_medium_confidence_values.nc\
+└── total_ssp585_medium_confidence_values.nc
+
+## Packages
+
+Now, some package are required for the R version 4.5.2.
+
+```{r}
+#| echo: true
+#| include: false
+# install.packages(c(
+#   "sf", "terra", "dplyr", "tidyr", "stringr", "purrr",
+#   "jsonlite", "httr2", "geodata", "ncdf4", "glue", "ggplot2", "scales", "mapview", "tibble"
+# ))
+
+# Spatial vector and raster handling
+library(sf)
+library(terra)
+# Data wrangling
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+# JSON parsing and HTTP requests (WorldPop and Zenodo APIs)
+library(jsonlite)
+library(httr2)
+# Administrative boundaries download (GADM)
+library(geodata)
+# Interactive map for QC visualisation
+library(mapview)
+# NetCDF reading for IPCC AR6 sea-level files
+library(ncdf4)
+# String interpolation used in file path construction
+library(glue)
+# Plotting and axis formatting
+library(ggplot2)
+library(scales)
+library(tibble)
+
+# Disable spherical geometry to avoid edge-case errors during buffering and intersections.
+# Metric distances are computed later in a projected CRS (EPSG:32631).
+sf::sf_use_s2(FALSE)
+# Suppress terra progress bars to keep console output clean
+terraOptions(progress = 1)
+```
+
+## Parameters, folder structure and functions
+
+This section sets the core parameters of the workflow and defines the helper functions used throughout. Keeping these together makes the script easier to reuse for another coastal city study :
+
+-   Set global parameters and replace non-alphanumeric characters (safe_slug)
+
+-   Loads only the relevant elevation tiles from the DeltaDTM (get_deltadtm_crop)
+
+-   Downloads a population count raster from the WorldPop API (get_worldpop_raster)
+
+-   Downloads from an API Zenodo the ippc files scenarios (get_zenodo_files; download_ippc_slr; extract_ippc_slr)
+
+-   Keeping only areas that are physically reachable from the ocean (flood_connected)
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+# ══════════════════════════════════════════════════════════════════════════
+# STUDY AREA PARAMETERS
+# To run the analysis for another European coastal city, edit ONLY this block.
+# The rest of the script is generic and will adapt automatically.
+# ══════════════════════════════════════════════════════════════════════════
+city_name       <- "Ostend"     # display name used in plot titles and file paths
+country_iso3    <- "BEL"        # ISO3 country code (WorldPop + GADM)
+city_admin_name <- "Oostende"   # municipality name as it appears in GADM NAME_3
+city_lat        <- 51.23        # latitude (decimal degrees) for SLR + GPD lookups
+city_lon        <-  2.92        # longitude (decimal degrees)
+gadm_level      <- 3            # GADM admin level: BE/NL use 3, FR uses 5, IT 3-4
+study_buffer_km <- 5            # km added around the municipal boundary
+worldpop_year   <- 2020         # baseline year for the population raster
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Input data folders ─────────────────────────────────────────────────────────
+# DeltaDTM tiles must be downloaded and stored locally before running this script.
+# IPCC NetCDF files are also expected to be present in ipcc_dir.
+deltadtm_dir <- "data/deltadtm_tiles"
+gadm_dir     <- "data/gadm"
+ipcc_dir     <- "data/slr"
+
+# ── Output folder ──────────────────────────────────────────────────────────────
+out_dir <- "outputs/ostend"
+
+# ── IPCC AR6 scenarios ─────────────────────────────────────────────────────────
+ipcc_scenarios <- c("ssp126", "ssp245", "ssp585")
+
+scenario_labels <- c(
+  ssp126 = "SSP1-2.6 (low emissions)",
+  ssp245 = "SSP2-4.5 (intermediate emissions)",
+  ssp585 = "SSP5-8.5 (high emissions)"
+)
+
+# Create all required output sub-directories if they do not already exist
+for (d in c(out_dir,
+            file.path(out_dir, "rasters"),
+            file.path(out_dir, "vectors"),
+            file.path(out_dir, "cache"),
+            file.path(out_dir, "plots"),
+            gadm_dir, ipcc_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# ── Helper: create a URL-safe file name suffix from the city name ──────────────
+safe_slug <- function(x) {
+  x |> str_to_lower() |>
+    str_replace_all("[^a-z0-9]+", "_") |>
+    str_replace_all("(^_+|_+$)", "")
+}
+city_slug <- safe_slug(city_name)
+
+# ── Helper: load only the DeltaDTM tiles that overlap the study area ───────────
+# Avoids reading unnecessary files and keeps memory use low.
+# Merges overlapping tiles via a virtual raster, removes the NoData sentinel (30),
+# and clips the result to the study extent.
+get_deltadtm_crop <- function(study_area_ll, deltadtm_dir) {
+  tif_files <- list.files(deltadtm_dir, pattern = "\\.tif$",
+                          full.names = TRUE, recursive = TRUE)
+  if (length(tif_files) == 0)
+    stop("No DeltaDTM GeoTIFF files found in deltadtm_dir.")
+
+  # Keep only tiles whose bounding box intersects the study area
+  study_ext <- terra::ext(terra::vect(study_area_ll))
+  relevant  <- Filter(function(f) {
+    e <- terra::ext(terra::rast(f))
+    xmin(e) < xmax(study_ext) && xmax(e) > xmin(study_ext) &&
+      ymin(e) < ymax(study_ext) && ymax(e) > ymin(study_ext)
+  }, tif_files)
+
+  if (length(relevant) == 0)
+    stop("No DeltaDTM tile intersects the study area.")
+
+  message(sprintf("DeltaDTM: %d tile(s) selected out of %d", length(relevant), length(tif_files)))
+  r <- terra::vrt(relevant)             # merge tiles lazily (no data duplication)
+  r <- terra::classify(r, cbind(30, NA))  # 30 is the DeltaDTM NoData sentinel value
+  r <- terra::crop(r, terra::vect(study_area_ll), snap = "out")
+  r <- terra::mask(r, terra::vect(study_area_ll))
+  names(r) <- "elev_m"
+  r
+}
+
+# ── Helper: download the WorldPop population count raster via the REST API ─────
+# Falls back to the nearest available year if the requested year is not published.
+get_worldpop_raster <- function(iso3, year = 2020, cache_dir = tempdir()) {
+  api_url <- sprintf("https://www.worldpop.org/rest/data/pop/wpgp?iso3=%s", iso3)
+  meta <- request(api_url) |>
+    req_user_agent("coastal-slr-qmd/1.0") |>
+    req_perform() |>
+    resp_body_json(simplifyVector = TRUE)
+
+  if (is.null(meta$data) || nrow(meta$data) == 0)
+    stop("No WorldPop entry found for this ISO3 code.")
+
+  tb <- as_tibble(meta$data) |> mutate(popyear = as.integer(popyear))
+
+  # Select exact year, or the closest available one
+  row <- if (year %in% tb$popyear) {
+    tb |> filter(popyear == year) |> slice(1)
+  } else {
+    tb |> mutate(d = abs(popyear - year)) |> arrange(d) |> slice(1)
+  }
+
+  file_url   <- row$files[[1]][1]
+  local_file <- file.path(cache_dir, basename(file_url))
+  # Skip download if the file is already cached
+  if (!file.exists(local_file))
+    download.file(file_url, destfile = local_file, mode = "wb", quiet = FALSE)
+
+  r <- terra::rast(local_file)
+  names(r) <- paste0("pop_", row$popyear)
+  r
+}
+
+# ── Helper: list all files in a Zenodo record (used for IPCC data) ─────────────
+get_zenodo_files <- function(record_id = "6382554") {
+  url  <- paste0("https://zenodo.org/api/records/", record_id)
+  data <- request(url) |> req_perform() |> resp_body_json()
+  tibble(
+    filename = map_chr(data$files, ~ .x$key),
+    url      = map_chr(data$files, ~ .x$links$self),
+    size_mb  = map_dbl(data$files, ~ .x$size) / 1e6
+  )
+}
+
+# ── Helper: optional download of IPCC AR6 NetCDF files from Zenodo ─────────────
+# Not called automatically; run manually if the NetCDF files are missing.
+download_ipcc_slr <- function(scenarios, ipcc_dir, confidence = "medium") {
+  files_tbl <- get_zenodo_files("6382554")
+  for (ssp in scenarios) {
+    pattern <- glue("total_{ssp}_{confidence}_confidence_values.nc")
+    row <- files_tbl |> filter(str_detect(filename, fixed(pattern)))
+    if (nrow(row) == 0)
+      row <- files_tbl |> filter(str_detect(filename, ssp),
+                                 str_detect(filename, confidence),
+                                 str_detect(filename, "\\.nc$"))
+    if (nrow(row) == 0) { warning("IPCC file not found for ", ssp); next }
+    fpath <- file.path(ipcc_dir, row$filename[1])
+    if (!file.exists(fpath)) download.file(row$url[1], destfile = fpath, mode = "wb")
+  }
+}
+
+# ── Helper: extract SLR values for the IPCC grid point nearest to the target ───
+# Returns a tidy data frame with columns: scenario, quantile, year, slr_m.
+# slr_m is in metres relative to the 1995–2014 mean sea level baseline.
+extract_ipcc_slr <- function(nc_file, scenario, lat_target, lon_target) {
+  nc <- ncdf4::nc_open(nc_file)
+  on.exit(ncdf4::nc_close(nc))  # ensures the file is closed even if an error occurs
+
+  lats      <- ncdf4::ncvar_get(nc, "lat")
+  lons      <- ncdf4::ncvar_get(nc, "lon")
+  years     <- ncdf4::ncvar_get(nc, "years")
+  quantiles <- ncdf4::ncvar_get(nc, "quantiles")
+
+  slr_raw <- ncdf4::ncvar_get(nc, "sea_level_change")
+  message("Dimensions sea_level_change: ", paste(dim(slr_raw), collapse = " x "))
+
+  # Find the grid cell whose centre is closest to the target coordinates
+  dist  <- sqrt((lats - lat_target)^2 + (lons - lon_target)^2)
+  i_loc <- which.min(dist)
+  message("Nearest grid point: lat=", round(lats[i_loc], 3),
+          " lon=", round(lons[i_loc], 3))
+
+  # Extract the [years x quantiles] matrix for this location and convert mm -> m
+  slr_point <- slr_raw[i_loc, , ]
+  expand.grid(year = years, quantile = quantiles) |>
+    dplyr::mutate(
+      scenario = scenario,
+      slr_m    = as.vector(slr_point) / 1000
+    ) |>
+    dplyr::arrange(scenario, quantile, year)
+}
+
+# ── Helper: ocean-connectivity flood filter ────────────────────────────────────
+# This function keeps only flood pixels that are spatially contiguous with
+# open ocean, following the Climate Central / WorldPop "connected bathtub" approach.
+#
+# Key insight: ocean pixels are NA.
+# The algorithm extends the raster by n_border cells so that a ring of ocean
+# pixels always surrounds the study area, then:
+#   1. Builds a binary surface: 1 = flooded land OR ocean, NA = dry land.
+#   2. Labels connected components (8-connectivity).
+#   3. Keeps only patches that contain at least one ocean pixel.
+#   4. Returns land pixels belonging to those ocean-connected patches.
+flood_connected <- function(elev_raster, slr_val, n_border = 5L) {
+  flooded_land  <- terra::ifel(!is.na(elev_raster) & elev_raster <= slr_val, 1L, NA)
+  elev_ext      <- terra::extend(elev_raster, n_border)
+  flood_ext     <- terra::extend(flooded_land, n_border)
+  ocean_ext     <- terra::ifel(is.na(elev_ext), 1L, NA)
+  # cover() fills NA cells in flood_ext with ocean_ext values (merges the two masks)
+  combined      <- terra::cover(flood_ext, ocean_ext)
+  patches       <- terra::patches(combined, directions = 8L, zeroAsNA = TRUE)
+  # Identify which patch IDs touch at least one ocean pixel
+  ocean_patch_r <- terra::ifel(!is.na(ocean_ext), patches, NA)
+  ocean_ids     <- unique(na.omit(terra::values(ocean_patch_r, mat = FALSE)))
+
+  if (length(ocean_ids) == 0L) {
+    warning("flood_connected: no ocean pixels found; returning empty raster.")
+    return(terra::ifel(!is.na(elev_raster), NA_integer_, NA_integer_))
+  }
+
+  # Remap ocean-connected patches to 1, isolated patches to NA
+  rcl           <- cbind(ocean_ids, rep(1L, length(ocean_ids)))
+  connected_ext <- terra::classify(patches, rcl, others = NA)
+  # Crop back to original extent and remove ocean pixels from the output
+  connected     <- terra::crop(connected_ext, elev_raster)
+  result        <- terra::mask(connected, flooded_land, maskvalue = NA)
+  names(result) <- "flooded"
+  result
+}
+# ── Helper: Generalized Pareto Distribution return level ─────────────────────
+# Returns the storm-surge height (m above local MSL) for a given return
+# period RP. Follows Hermans et al. (2023) and Coles (2001):
+#   z_RP = mu + (sigma/xi) * ((lambda * RP)^xi - 1)   for xi != 0
+#   z_RP = mu + sigma * log(lambda * RP)              for xi = 0
+gpd_return_level <- function(mu, sigma, xi, lambda, RP) {
+  if (abs(xi) < 1e-6) {
+    mu + sigma * log(lambda * RP)
+  } else {
+    mu + (sigma / xi) * ((lambda * RP)^xi - 1)
+  }
+}
+
+
+```
+
+## Study zone
+
+The analysis is not limited to the exact city polygon from GADM database. A 5 km buffer is added around the city to capture nearby low-lying terrain that may still be relevant for coastal exposure.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+# Download GADM boundaries at the relevant admin level (cached after first run)
+admin_data <- geodata::gadm(country    = country_iso3,
+                            level      = gadm_level,
+                            path       = gadm_dir,
+                            resolution = 1)
+admin_df <- as.data.frame(admin_data)
+# Extract the city polygon. Different countries use different name columns,
+# so we look across NAME_2..NAME_5 to find the one that matches.
+name_cols <- grep("^NAME_[1-5]$", names(admin_df), value = TRUE)
+match_col <- NULL
+for (col in name_cols) {
+  if (city_admin_name %in% admin_df[[col]]) { match_col <- col; break }
+}
+
+if (is.null(match_col)) {
+  # Diagnostic hint: suggest names that look similar (fuzzy match).
+  # Useful when the spelling differs slightly from what the user expects
+  # (e.g. accents, native vs English name).
+  all_names <- unique(unlist(lapply(name_cols, function(c) admin_df[[c]])))
+  closest   <- agrep(city_admin_name, all_names,
+                     max.distance = 0.2, value = TRUE, ignore.case = TRUE)
+  hint <- if (length(closest) > 0) {
+    paste0(" Did you mean: ", paste(head(closest, 5), collapse = ", "), " ?")
+  } else {
+    paste0(" Sample of available names: ",
+           paste(head(sort(all_names), 10), collapse = ", "), " ...")
+  }
+  stop("City '", city_admin_name, "' not found in GADM at admin level ",
+       gadm_level, ".", hint)
+}
+
+message(sprintf("Found '%s' in GADM column %s", city_admin_name, match_col))
+
+# Select the matching row(s). We compute the boolean on the data.frame
+# (not the SpatVector) for the same reason as above.
+keep_rows <- admin_df[[match_col]] == city_admin_name
+city_sf   <- sf::st_as_sf(admin_data[keep_rows, ]) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+if (nrow(city_sf) == 0)
+  stop("City polygon is empty after subsetting. Verify ", match_col, " in GADM.")
+
+# Save the city boundary for use in the Shiny app
+st_write(city_sf,
+         file.path(out_dir, "vectors", paste0(city_slug, "_boundary.gpkg")),
+         delete_dsn = TRUE, quiet = TRUE)
+
+# Buffer in a metric CRS (EPSG:32631, UTM zone 31N) then reproject back to WGS84
+city_metric   <- st_transform(city_sf, "EPSG:32631")
+study_metric  <- st_buffer(city_metric, dist = study_buffer_km * 1000)
+study_area_ll <- st_transform(study_metric, 4326)
+
+# Dissolve all municipalities into one polygon for land masking
+country_sf <- sf::st_as_sf(admin_data) |>
+  st_union() |>
+  st_make_valid() |>
+  st_transform(4326)
+
+# Clip the buffer to land only (for display; the full buffer is used in analysis)
+study_land <- st_intersection(study_area_ll, country_sf) |>
+  st_make_valid()
+
+# Interactive QC map: orange = study zone, yellow = municipal boundary
+mapviewOptions(basemaps = c("OpenStreetMap", "Esri.OceanBasemap", "Esri.WorldImagery"))
+mapview(study_land,
+        layer.name    = paste0("Study zone ( ", study_buffer_km, " km)"),
+        col.regions   = "#FF9800",
+        alpha.regions = 0.20,
+        color         = "#FF9800",
+        lwd           = 2) +
+mapview(city_sf,
+        layer.name    = "communal limit",
+        col.regions   = "#FFEB3B",
+        alpha.regions = 0.20,
+        color         = "#FFEB3B",
+        lwd           = 2.5)
+```
+
+## DeltaDTM elevation raster
+
+DeltaDTM is the core topographic input of the workflow. The function loads only the tiles intersecting the study city, merges them through a virtual raster, removes the sentinel value (30 = NoData), then crops and masks to the buffered city extent. Ocean pixels are NA in this dataset (Pronk et al. 2024).
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+# Load, merge, and clip DeltaDTM tiles to the study extent
+deltadtm <- get_deltadtm_crop(study_area_ll, deltadtm_dir)
+
+# Save to disk for the Shiny app
+writeRaster(deltadtm,
+            file.path(out_dir, "rasters", paste0(city_slug, "_deltadtm.tif")),
+            overwrite = TRUE)
+
+# QC summary: elevation range and share of low-lying pixels
+cat("Minimum elevation:", round(global(deltadtm, min, na.rm = TRUE)[[1]], 2), "m\n")
+cat("Maximum elevation:", round(global(deltadtm, max, na.rm = TRUE)[[1]], 2), "m\n")
+vals <- values(deltadtm, na.rm = TRUE)
+cat("Pixels <= 1 m:", round(sum(vals <= 1) / length(vals) * 100, 1), "%\n")
+cat("Pixels <= 2 m:", round(sum(vals <= 2) / length(vals) * 100, 1), "%\n")
+cat("Pixels <= 5 m:", round(sum(vals <= 5) / length(vals) * 100, 1), "%\n")
+```
+
+## WorldPop : 2020 baseline population raster
+
+Population data are downloaded automatically through the WorldPop API. Two outputs are saved: original population counts per pixel, and a density raster in inhabitants/km². The count raster is used for computing exposure totals; the density raster is used for the map gradient in the Shiny app.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+# Download the national raster and crop to the study area
+worldpop_raw  <- get_worldpop_raster(country_iso3, worldpop_year,
+                                     file.path(out_dir, "cache"))
+worldpop_crop <- terra::crop(worldpop_raw, terra::vect(study_area_ll))
+
+# Compute density: cellSize() returns the exact geodetic area per cell in WGS84,
+# correctly accounting for the cos(latitude) distortion at ~51 degrees N.
+pixel_area_km2   <- terra::cellSize(worldpop_crop, unit = "km")
+worldpop_density <- worldpop_crop / pixel_area_km2
+names(worldpop_density) <- "pop_per_km2"
+
+# Save both the count raster (for exposure totals) and the density raster (for mapping)
+writeRaster(worldpop_crop,
+            file.path(out_dir, "rasters", paste0(city_slug, "_worldpop.tif")),
+            overwrite = TRUE)
+writeRaster(worldpop_density,
+            file.path(out_dir, "rasters", paste0(city_slug, "_worldpop_density.tif")),
+            overwrite = TRUE)
+
+# QC summary
+cat("Total population in study area:",
+    format(round(global(worldpop_crop, sum, na.rm = TRUE)[[1]]), big.mark = ","), "\n")
+cat("Maximum population density:",
+    round(global(worldpop_density, max, na.rm = TRUE)[[1]]), "inhabitants/km2\n")
+```
+
+## SSP population projections (to 2100) with WorldPop.
+
+The 2020 WorldPop raster is the spatial baseline, but population is not static. This chunk fetches SSP-aligned demographic projections from the WorldPop API so that the Shiny app can show population exposure that evolves consistently with the chosen climate scenario and year, rather than being fixed at 2020 for all combinations.
+
+The three SSP scenarios are matched to the sea-level rise framework: SSP1 -\> SSP1-2.6, SSP2 -\> SSP2-4.5, SSP5 -\> SSP5-8.5.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+
+# ── Helper: fetch SSP-aligned population projections (2020-2100) ───────────────
+# Tries the WorldPop REST API first (gridded SSP rasters).
+# If those are unavailable for a scenario, falls back to applying national-level
+# SSP growth ratios from the IIASA database to the 2020 WorldPop baseline total.
+get_worldpop_projections <- function(iso3, study_area_ll, baseline_pop_2020,
+                                     cache_dir = tempdir()) {
+  proj_years  <- seq(2020, 2100, by = 10)
+  ssp_keys    <- c("ssp1", "ssp2", "ssp5")
+  # Maps WorldPop SSP keys to the scenario names used in this project
+  ssp_to_scen <- c(ssp1 = "ssp126", ssp2 = "ssp245", ssp5 = "ssp585")
+  ssp_ds      <- c(ssp1 = "wpgp_ssp1", ssp2 = "wpgp_ssp2", ssp5 = "wpgp_ssp5")
+
+  all_results <- list()
+  api_success <- logical(length(ssp_keys))
+  names(api_success) <- ssp_keys
+
+  for (ssp_key in ssp_keys) {
+    api_url <- sprintf("https://www.worldpop.org/rest/data/pop/%s?iso3=%s",
+                       ssp_ds[ssp_key], iso3)
+    # Attempt API call; return NULL silently on failure so fallback can run
+    meta <- tryCatch(
+      httr2::request(api_url) |>
+        httr2::req_user_agent("coastal-slr-qmd/1.0") |>
+        httr2::req_timeout(20) |>
+        httr2::req_perform() |>
+        httr2::resp_body_json(simplifyVector = TRUE),
+      error = function(e) NULL
+    )
+
+    tb <- if (!is.null(meta$data) && is.data.frame(meta$data) && nrow(meta$data) > 0) {
+      dplyr::as_tibble(meta$data) |>
+        dplyr::mutate(popyear = as.integer(popyear)) |>
+        dplyr::filter(popyear %in% proj_years)
+    } else NULL
+
+    if (!is.null(tb) && nrow(tb) > 0) {
+      message(sprintf("WorldPop SSP API OK for %s: %d years", ssp_key, nrow(tb)))
+      api_success[ssp_key] <- TRUE
+      for (i in seq_len(nrow(tb))) {
+        yr       <- tb$popyear[i]
+        file_url <- tryCatch(tb$files[[i]][1], error = function(e) NA_character_)
+        if (is.na(file_url)) next
+        local_file <- file.path(cache_dir, basename(file_url))
+        # Download only if not already cached
+        if (!file.exists(local_file)) {
+          tryCatch(
+            download.file(file_url, local_file, mode = "wb", quiet = FALSE),
+            error = function(e) { unlink(local_file); message("Download failed year ", yr) }
+          )
+        }
+        if (!file.exists(local_file)) next
+        r_crop <- tryCatch(
+          terra::crop(terra::rast(local_file), terra::vect(study_area_ll)),
+          error = function(e) NULL
+        )
+        if (is.null(r_crop)) next
+        # Store the population total for the study area
+        all_results[[length(all_results) + 1]] <- data.frame(
+          scenario   = ssp_to_scen[ssp_key],
+          source     = "WorldPop SSP raster",
+          year       = yr,
+          population = terra::global(r_crop, "sum", na.rm = TRUE)[[1]]
+        )
+      }
+    } else {
+      message(sprintf("WorldPop SSP rasters unavailable for %s - using IIASA fallback.", ssp_key))
+    }
+  }
+
+  # ── Fallback: IIASA SSP national growth ratios for Belgium ────────────────────
+  # Ratios express population relative to 2020 (1.000 = same as 2020).
+  # Applied only for scenarios where the WorldPop API returned no data.
+  ssp_ratios <- tibble::tribble(
+    ~year, ~ssp126, ~ssp245, ~ssp585,
+    2020,  1.000,   1.000,   1.000,
+    2030,  1.038,   1.042,   1.048,
+    2040,  1.065,   1.075,   1.088,
+    2050,  1.079,   1.097,   1.120,
+    2060,  1.081,   1.108,   1.148,
+    2070,  1.072,   1.110,   1.170,
+    2080,  1.053,   1.104,   1.184,
+    2090,  1.026,   1.092,   1.192,
+    2100,  0.994,   1.074,   1.196
+  )
+
+  missing_scens <- ssp_to_scen[!api_success]
+  if (length(missing_scens) > 0) {
+    fallback <- ssp_ratios |>
+      tidyr::pivot_longer(c(ssp126, ssp245, ssp585),
+                          names_to = "scenario", values_to = "ratio") |>
+      dplyr::filter(scenario %in% missing_scens) |>
+      dplyr::mutate(
+        population = baseline_pop_2020 * ratio,
+        source     = "Scaling IIASA (fallback)"
+      ) |>
+      dplyr::select(scenario, source, year, population)
+    all_results <- c(all_results, list(fallback))
+  }
+
+  dplyr::bind_rows(all_results)
+}
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+# Use the study-area total from the 2020 raster as the scaling baseline
+baseline_pop_2020 <- terra::global(worldpop_crop, "sum", na.rm = TRUE)[[1]]
+
+pop_proj_df <- get_worldpop_projections(
+  iso3              = country_iso3,
+  study_area_ll     = study_area_ll,
+  baseline_pop_2020 = baseline_pop_2020,
+  cache_dir         = file.path(out_dir, "cache")
+)
+
+# QC table: population in thousands for selected years
+pop_proj_df |>
+  dplyr::filter(year %in% c(2030, 2050, 2075, 2100)) |>
+  dplyr::mutate(pop_k = round(population / 1000, 1)) |>
+  dplyr::select(scenario, year, pop_k, source) |>
+  tidyr::pivot_wider(names_from = scenario, values_from = pop_k) |>
+  print()
+
+# Save for loading by the Shiny app at runtime
+saveRDS(pop_proj_df, file.path(out_dir, "pop_projections.rds"))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+# Caption indicates whether values come from gridded rasters or the IIASA fallback
+source_note <- if (all(pop_proj_df$source == "WorldPop SSP raster")) {
+  "Source: WorldPop SSP gridded projections"
+} else if (all(pop_proj_df$source == "Scaling IIASA (fallback)")) {
+  paste("Source: WorldPop 2020 baseline", "x", "IIASA SSP ratios (Belgium)")
+} else {
+  "Source: WorldPop SSP rasters + IIASA scaling (mixed)"
+}
+
+# Dashed line = IIASA fallback; solid line = WorldPop SSP raster
+p_pop <- ggplot(pop_proj_df,
+                aes(x = year, y = population / 1000, color = scenario, linetype = source)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.2) +
+  scale_color_manual(
+    values = c(ssp126 = "#2166ac", ssp245 = "#f4a582", ssp585 = "#d6604d"),
+    labels = scenario_labels
+  ) +
+  scale_linetype_manual(
+    values = c("WorldPop SSP raster" = "solid", "Scaling IIASA (fallback)" = "dashed")
+  ) +
+  scale_x_continuous(breaks = seq(2020, 2100, by = 10)) +
+  scale_y_continuous(labels = scales::label_number(suffix = " k")) +
+  labs(
+    title    = paste0("Population projections"),
+    subtitle = "Three SSP scenarios aligned with sea-level rise projections",
+    x = "Year", y = "Population (thousands)",
+    color = "Scenario", linetype = "Data source", caption = source_note
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+p_pop
+ggsave(file.path(out_dir, "plots", "pop_projections.png"),
+       p_pop, width = 10, height = 6, dpi = 300)
+```
+
+## IPCC AR6 sea-level rise projections (Extraction for Ostend)
+
+This workflow uses three IPCC AR6 scenarios:
+
+-   **SSP1-2.6**: low emissions, strong climate policies, warming limited to \~2.6 W/m² by 2100.
+-   **SSP2-4.5**: intermediate "middle of the road" emissions, \~4.5 W/m² by 2100.
+-   **SSP5-8.5**: high emissions, fossil-fueled development, \~8.5 W/m² by 2100.
+
+NetCDF files must be stored locally in `data/slr/`. Download them from [Zenodo — IPCC AR6 Sea Level Projections](https://zenodo.org/records/6382554) (Garner et al. 2021). Sea-level rise is extracted for the nearest IPCC grid point to the city studied (So you should change the target coordinates to fit with the city). The result is a tidy table with four variables: `scenario`, `quantile`, `year`, `slr_m`.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+# List all NetCDF files present in the IPCC data folder
+nc_files <- list.files(ipcc_dir, pattern = "\\.nc$", full.names = TRUE)
+cat("Available IPCC AR6 NetCDF files:\n")
+print(basename(nc_files))
+
+if (length(nc_files) < 3)
+  stop("Missing IPCC NetCDF files in data/slr/.")
+
+# Extract SLR projections for the grid point nearest to Ostend
+slr_all <- map_dfr(seq_along(ipcc_scenarios), function(i) {
+  ssp    <- ipcc_scenarios[i]
+  fmatch <- nc_files[str_detect(nc_files, ssp)]
+  if (length(fmatch) == 0) {
+    warning("No NetCDF file found for ", ssp)
+    return(NULL)
+  }
+  extract_ipcc_slr(fmatch[1], ssp,
+                 lat_target = city_lat,
+                 lon_target = city_lon)    # Ostend longitude
+})
+
+
+# QC table: median SLR in cm at key years
+slr_all |>
+  filter(quantile == 0.50) |>
+  filter(year %in% c(2030, 2050, 2070, 2100)) |>
+  mutate(slr_cm = round(slr_m * 100, 1)) |>
+  select(scenario, year, slr_cm) |>
+  pivot_wider(names_from = scenario, values_from = slr_cm) |>
+  print()
+
+# Save for loading by the Shiny app at runtime
+saveRDS(slr_all, file.path(out_dir, "slr_projections.rds"))
+
+# ── Duplicate extraction block (kept for diagnostic purposes) ─────────────────
+# This second block runs extract_ipcc_slr again with verbose messages and
+# saves the result a second time. It can be removed once the data are validated.
+extract_ipcc_slr <- function(nc_file, scenario, lat_target, lon_target) {
+  nc <- ncdf4::nc_open(nc_file)
+  on.exit(ncdf4::nc_close(nc))
+
+  lats      <- ncdf4::ncvar_get(nc, "lat")
+  lons      <- ncdf4::ncvar_get(nc, "lon")
+  years     <- ncdf4::ncvar_get(nc, "years")
+  quantiles <- ncdf4::ncvar_get(nc, "quantiles")
+
+  slr_raw <- ncdf4::ncvar_get(nc, "sea_level_change")
+  message("Dimensions sea_level_change : ", paste(dim(slr_raw), collapse = " x "))
+  message("  lats=", length(lats),
+          " | years=", length(years),
+          " | quantiles=", length(quantiles))
+
+  dist  <- sqrt((lats - lat_target)^2 + (lons - lon_target)^2)
+  i_loc <- which.min(dist)
+  message("Nearest grid point : lat=", round(lats[i_loc], 3),
+          " lon=", round(lons[i_loc], 3))
+
+  slr_point <- slr_raw[i_loc, , ]
+
+  expand.grid(year = years, quantile = quantiles) |>
+    dplyr::mutate(
+      scenario = scenario,
+      slr_m    = as.vector(slr_point) / 1000  # mm -> m
+    ) |>
+    dplyr::arrange(scenario, quantile, year)
+}
+
+nc_files <- list.files(ipcc_dir, pattern = "\\.nc$", full.names = TRUE)
+if (length(nc_files) == 0)
+  stop("Aucun fichier NC trouve dans ", ipcc_dir)
+
+slr_all <- purrr::map_dfr(seq_along(ipcc_scenarios), function(i) {
+  ssp    <- ipcc_scenarios[i]
+  fmatch <- nc_files[stringr::str_detect(nc_files, ssp)]
+  if (length(fmatch) == 0) { warning("Pas de fichier NC pour ", ssp); return(NULL) }
+  message("\n=== Extraction : ", ssp, " ===")
+  extract_ipcc_slr(fmatch[1], ssp, lat_target = 51.23, lon_target = 2.92)
+})
+
+slr_all |>
+  filter(quantile == 0.50, year %in% c(2030, 2050, 2070, 2100)) |>
+  mutate(slr_cm = round(slr_m * 100, 1)) |>
+  select(scenario, year, slr_cm) |>
+  pivot_wider(names_from = scenario, values_from = slr_cm) |>
+  print()
+
+saveRDS(slr_all, file.path(out_dir, "slr_projections.rds"))
+
+# ── Prepare data for the SLR plot ─────────────────────────────────────────────
+# Keep only the 5th, 50th, and 95th percentiles for the ribbon + median line
+slr_plot_df <- slr_all |>
+  filter(quantile %in% c(0.05, 0.50, 0.95), year >= 2020, year <= 2100) |>
+  mutate(scenario_label = scenario_labels[scenario]) |>
+  arrange(scenario, quantile, year)
+
+# ── Plot: median trajectories + 5-95% uncertainty ribbons ─────────────────────
+p_slr <- ggplot(
+  slr_plot_df |> filter(quantile == 0.50),
+  aes(x = year, y = slr_m * 100, color = scenario)
+) +
+  geom_ribbon(
+    data = slr_plot_df |>
+      filter(quantile %in% c(0.05, 0.95)) |>
+      select(-scenario_label) |>
+      pivot_wider(names_from = quantile, values_from = slr_m) |>
+      arrange(scenario, year),
+    aes(x = year, ymin = `0.05` * 100, ymax = `0.95` * 100, fill = scenario),
+    color = NA, alpha = 0.15, inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = c(ssp126 = "#2166ac", ssp245 = "#f4a582", ssp585 = "#d6604d"),
+    labels = scenario_labels
+  ) +
+  scale_fill_manual(
+    values = c(ssp126 = "#2166ac", ssp245 = "#f4a582", ssp585 = "#d6604d"),
+    labels = scenario_labels
+  ) +
+  scale_x_continuous(breaks = seq(2020, 2100, by = 10)) +
+  scale_y_continuous(labels = scales::label_number(suffix = " cm")) +
+  labs(
+    title    = "IPCC AR6 sea-level rise projections for Ostend",
+    subtitle = "Line = median | Ribbon = 5th to 95th percentile",
+    x = "Year", y = "Sea-level rise (cm)",
+    color = "Scenario", fill = "Scenario",
+    caption = "Source: IPCC AR6 sea-level projections | Zenodo 6382554"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+p_slr
+ggsave(file.path(out_dir, "plots", "slr_projections.png"),
+       p_slr, width = 10, height = 6, dpi = 300)
+```
+
+## Extreme sea level (ESL)
+
+To get a more realistic flood risk, it's important to account short-duration extreme events like storm surges and wind waves that temporarily raise the water level well above the mean. The height of a 100-year storm surge is added (an extreme coastal event with a 1% probability of occurring in any given year) on top of the projected mean sea-level rise. This surge height is derived from extreme value analyses of European tide-gauge records (Hermans et al. 2023).\
+\
+The storm-surge component is stationary and doesn't change with the SSP scenario or year. This is consistent with the IPCC AR6 assessment that says future coastal flood hazard will be dominated by sea-level rise rather than by changes in storm characteristics (Fox-Kemper et al. 2021). Storm-surge return levels are pre-computed for 8 reference European tide gauges spanning the main coastal regimes (North Sea, Atlantic, Mediterranean, Adriatic, Baltic). For any study city, the value used is taken from the nearest of these gauges.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+# ── GPD parameters at representative European tide gauges ────────────────────
+# Central-estimate values consistent with Hermans et al. (2023, Extended Data
+# Fig. 1) and regional storm-surge return-level studies. These values are
+# *indicative* and should be validated against local sources (KMI/MUMM, BSH,
+# SHOM, ISPRA, Deltares...) for production use.
+#
+# Columns:
+#   mu     : GPD threshold (m above local mean sea level)
+#   sigma  : GPD scale parameter (m)
+#   xi     : GPD shape parameter (dimensionless)
+#   lambda : average number of threshold exceedances per year
+gpd_eu_gauges <- tibble::tribble(
+  ~gauge_city,        ~lat,    ~lon,   ~mu,    ~sigma, ~xi,    ~lambda,
+  "Oostende",         51.23,    2.92,  1.40,   0.18,   -0.05,   2,   # BE
+  "Hoek van Holland", 51.98,    4.12,  1.80,   0.25,   -0.10,   2,   # NL
+  "Cuxhaven",         53.87,    8.72,  2.10,   0.35,   -0.05,   2,   # DE
+  "Brest",            48.38,   -4.50,  3.50,   0.30,   -0.05,   2,   # FR
+  "Marseille",        43.28,    5.35,  0.25,   0.10,    0.00,   2,   # FR   
+  "Barcelona",        41.35,    2.17,  0.20,   0.10,    0.05,   2,   # ES
+  "Venezia",          45.42,   12.40,  0.55,   0.22,    0.10,   2,   # IT
+  "Helsinki",         60.15,   24.97,  0.40,   0.15,    0.00,   2    # FI
+)
+
+# ── Return period for the storm-surge component ──────────────────────────────
+# 100 years is the standard reference
+return_period <- 100
+
+# ── Find the nearest tide gauge to the study city ───────────────────────────
+# Simple great-circle approximation (sufficient for ranking nearby gauges)
+nearest_gauge <- gpd_eu_gauges |>
+  dplyr::mutate(dist_km = sqrt((lat - city_lat)^2 + (lon - city_lon)^2) * 111) |>
+  dplyr::arrange(dist_km) |>
+  dplyr::slice(1)
+
+message(sprintf("Nearest tide gauge: %s (%.0f km from %s)",
+                nearest_gauge$gauge_city, nearest_gauge$dist_km, city_name))
+
+if (nearest_gauge$dist_km > 200) {
+  warning("Nearest tide gauge is more than 200 km from the city. ",
+          "Storm-surge estimate may be unreliable; consider adding a closer ",
+          "gauge to gpd_eu_gauges.")
+}
+
+# ── Compute the stationary storm-surge return level ─────────────────────────
+surge_m <- gpd_return_level(
+  mu     = nearest_gauge$mu,
+  sigma  = nearest_gauge$sigma,
+  xi     = nearest_gauge$xi,
+  lambda = nearest_gauge$lambda,
+  RP     = return_period
+)
+
+message(sprintf("Storm surge (%d-year return period) at %s: %.2f m above local MSL",
+                return_period, nearest_gauge$gauge_city, surge_m))
+
+# ── Combine SLR + storm surge into a total projection ──────────────────
+# The surge component is stationary; the SLR component varies with scenario,
+# year and quantile. Their sum is the total extreme sea level reached during
+# a 100-year storm under each future scenario.
+esl_projections <- slr_all |>
+  dplyr::mutate(
+    surge_m       = surge_m,
+    return_period = return_period,
+    gauge_used    = nearest_gauge$gauge_city,
+    esl_total_m   = slr_m + surge_m
+  ) |>
+  dplyr::select(scenario, quantile, year, slr_m, surge_m,
+                return_period, gauge_used, esl_total_m)
+
+# QC table: median trajectories at key years (in cm)
+esl_projections |>
+  dplyr::filter(quantile == 0.50, year %in% c(2030, 2050, 2070, 2100)) |>
+  dplyr::mutate(
+    slr_cm       = round(slr_m * 100, 1),
+    surge_cm     = round(surge_m * 100, 1),
+    esl_total_cm = round(esl_total_m * 100, 1)
+  ) |>
+  dplyr::select(scenario, year, slr_cm, surge_cm, esl_total_cm) |>
+  tidyr::pivot_wider(names_from = scenario,
+                     values_from = c(slr_cm, surge_cm, esl_total_cm)) |>
+  print()
+
+# Save for loading by the Shiny app at runtime
+saveRDS(esl_projections, file.path(out_dir, "esl_projections.rds"))
+
+# Median trajectories of SLR alone vs SLR + 100-year storm surge.
+# Solid lines = total ESL; dashed lines = SLR component only (for comparison).
+esl_plot_df <- esl_projections |>
+  dplyr::filter(quantile == 0.50) |>
+  tidyr::pivot_longer(c(slr_m, esl_total_m),
+                      names_to = "component", values_to = "value_m") |>
+  dplyr::mutate(
+    component = dplyr::recode(component,
+                              slr_m       = "SLR only (AR6)",
+                              esl_total_m = "Total ESL (SLR + 100-year surge)")
+  )
+
+p_esl <- ggplot(esl_plot_df,
+                aes(x = year, y = value_m * 100,
+                    color = scenario, linetype = component)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = c(ssp126 = "#2166ac", ssp245 = "#f4a582", ssp585 = "#d6604d"),
+    labels = scenario_labels
+  ) +
+  scale_linetype_manual(
+    values = c("SLR only (AR6)" = "dashed",
+               "Total ESL (SLR + 100-year surge)" = "solid")
+  ) +
+  scale_x_continuous(breaks = seq(2020, 2100, by = 10)) +
+  scale_y_continuous(labels = scales::label_number(suffix = " cm")) +
+  labs(
+    title    = paste0("Total extreme sea level - ", city_name),
+    subtitle = paste0(return_period, "-year storm surge fit at ",
+                      nearest_gauge$gauge_city,
+                      " | Median trajectories (50th percentile)"),
+    x = "Year", y = "Height above 1995-2014 MSL (cm)",
+    color = "Scenario", linetype = "Component"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+p_esl
+ggsave(file.path(out_dir, "plots", "esl_projections.png"),
+       p_esl, width = 10, height = 6, dpi = 300)
+```
+
+## Saved outputs
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| paged-print: false
+cat("=== Files produced for the Shiny application ===\n\n")
+cat("Rasters:\n")
+list.files(file.path(out_dir, "rasters"), full.names = FALSE) |>
+  paste(" -", x = _) |> cat(sep = "\n")
+cat("\nVectors:\n")
+list.files(file.path(out_dir, "vectors"), full.names = FALSE) |>
+  paste(" -", x = _) |> cat(sep = "\n")
+cat("\nRDS files:\n")
+cat(" - slr_projections.rds\n")
+cat(" - pop_projections.rds\n")
+cat(" - esl_projections.rds\n")   # <-- new line
+cat("\nAll outputs are stored in:", out_dir, "\n")
+```
+
+## Launch the Shiny App
+
+Once all preprocessing outputs have been generated, the Shiny dashboard can be launched directly from the next chunk. This opens the interactive app in your default browser.
+
+```{r}
+#| eval: false
+#| echo: true
+# One-time install if needed: install.packages("quarto")
+# Renders and serves the Quarto Shiny document.
+# The path is relative to the working directory — adjust if your two files
+# are in different folders.
+quarto::quarto_serve("coastal_flood_shiny_NJR.qmd")
+```
+
+## Methodological limits :
+
+The population projections are based on the national-level ratios from the IIASA SSP scenario, applied to the WorldPop 2020 spatial reference dataset; therefore, they do not actually reflect the official projection for the study area.
+
+Artificial coastal protection structures (dikes, storm surge barriers) are not represented in DeltaDTM. The ocean connectivity filter in the Shiny application partially addresses this by allowing the user to switch between a simple exposure view and one where only areas connected to the sea are shown as at risk. This allows for the simulation of the effects of coastal protection structures C*limate Central \| Land below X meters of water*. (2026)).
+
+Another limitation of the model is that in some places, such as the city studied here (Ostend), the tide rises by approximately 4.5 meters between low and high tide. This means that areas at an elevation of 1.5 meters are already flooded at high tide today, even without any future sea-level rise. Including the effect of tides, or more precisely defining the location of coastal barriers, can improve the model's accuracy.
+
+The resulting estimate of the Extreme sea level (ESL) is a regional proxy rather than a specific fit, and its accuracy decreases with the distance between the study city and the nearest reference gauge.
+
+## Bibliographie
+
+-   *Climate Central \| Land below X meters of water*. (2026). Consulte 7 mai 2026, a l'adresse <https://coastal.climatecentral.org/map/12/3.0121/51.1994/?theme=water_level&map_type=water_level_above_mhhw&basemap=roadmap&contiguous=true&elevation_model=best_available&refresh=true&water_level=0.4&water_unit=m>
+
+-   European Environment Agency. (2024). *Extreme sea levels and coastal flooding in Europe*. <https://www.eea.europa.eu/en/analysis/indicators/extreme-sea-levels-and-coastal-flooding>
+
+-   Garner, G. G., et al. (2021). *IPCC AR6 Sea Level Projections* \[Dataset\]. Zenodo. <https://doi.org/10.5281/zenodo.6382554>
+
+-   Pronk, M., et al. (2024). DeltaDTM: A global coastal digital terrain model. *Scientific Data*, *11*(1), 273. <https://doi.org/10.1038/s41597-024-03091-9>
+
+-   Lehner, B., Grill G. (2013). Global river hydrography and network routing. *Hydrological Processes*, 27(15): 2171-2186. <https://doi.org/10.1002/hyp.9740>
+
+-   Coles, S. (2001). *An Introduction to Statistical Modeling of Extreme Values*. Springer Series in Statistics.
+
+-   Fox-Kemper, B., et al. (2021). Ocean, Cryosphere and Sea Level Change. In *Climate Change 2021: The Physical Science Basis*. Contribution of Working Group I to the Sixth Assessment Report of the IPCC.
+
+-   Haigh, I. D., et al. (2023). GESLA Version 3: A major update to the global higher-frequency sea-level dataset. *Geoscience Data Journal*, 10(3), 293-314. https://doi.org/10.1002/gdj3.174
+
+-   Hermans, T. H. J., et al. (2023). The timing of decreasing coastal flood protection due to sea-level rise. *Nature Climate Change*, 13(4), 359-366. https://doi.org/10.1038/s41558-023-01616-5
