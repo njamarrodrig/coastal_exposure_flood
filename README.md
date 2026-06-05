@@ -10,7 +10,7 @@ A workflow to assess coastal inundation exposure for a European coastal city und
 
 ## How to run
 
-run all the chunk in the preprocessing qmd file.
+Run all the chunk in the preprocessing qmd file.
 
 ## Changes since the last version
 
